@@ -1,2 +1,7 @@
+# Local review only; production dependencies require approved pinning.
 fastapi>=0.115,<1
-uvicorn>=0.34,<1
+pydantic>=2.7,<3
+email-validator>=2,<3
+cryptography>=44,<48
+SQLAlchemy>=2.0,<3
+httpx>=0.27,<1

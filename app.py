@@ -25,6 +25,16 @@ BASE = Path(__file__).resolve().parent
 HTML_FILE = BASE / "index.html"
 app = FastAPI(title="PatroAI Commercial Assistant", docs_url=None, redoc_url=None, openapi_url=None)
 
+# INTEGRATION REVIEW CANDIDATE ONLY — gated and disabled by default.
+# Do not use this entrypoint in Railway without independent AO-01 approval.
+from commercial.router import router as commercial_router, GateError, _error
+app.include_router(commercial_router)
+
+@app.exception_handler(GateError)
+async def commercial_gate_exception(request: Request, exc: GateError):
+    return _error(exc.status, exc.code)
+
+
 SYSTEM_PROMPT = """Você é o assistente comercial virtual da PatroAI Consultech.
 Objetivo: explicar, com transparência, soluções potenciais de IA empresarial,
 integração com ferramentas existentes, orquestração multiagente, governança e
@@ -148,7 +158,10 @@ def call_provider(message: str, history: list[ChatHistory], language: str) -> st
 async def security_headers(request: Request, call_next):
     if request.method == "POST":
         length = request.headers.get("content-length", "0")
-        if length.isdigit() and int(length) > 12000:
+        # Global chat limit is deliberately unchanged at 12000 bytes.
+        # Handoff's separate 48 KiB route also streams/checks its entire body.
+        body_limit = 49152 if request.url.path == "/v1/public/handoffs" else 12000
+        if length.isdigit() and int(length) > body_limit:
             return JSONResponse({"detail": "Request too large"}, status_code=413)
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
