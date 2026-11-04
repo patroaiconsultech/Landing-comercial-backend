@@ -1,7 +1,6 @@
-"""PatroAI landing + public read-only AI assistant.
+"""PatroAI public AI assistant + separately gated commercial/admin candidate.
 
-This service is deliberately NOT the C01 backend. No DB, no tenant access,
-no administrative tools, no customer persistence, no secret in browser.
+Public chat is independent of admin database availability. No bootstrap endpoint.
 """
 from __future__ import annotations
 
@@ -18,6 +17,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
@@ -29,6 +30,17 @@ app = FastAPI(title="PatroAI Commercial Assistant", docs_url=None, redoc_url=Non
 # Do not use this entrypoint in Railway without independent AO-01 approval.
 from commercial.router import router as commercial_router, GateError, _error
 app.include_router(commercial_router)
+
+# Dashboard read/write endpoints: ALWAYS fail-closed unless separately authorized.
+from dashboard.router import router as admin_router
+app.include_router(admin_router)
+
+@app.exception_handler(RequestValidationError)
+async def admin_validation_sanitized(request, exc):
+    # Never echo password/OTP/contact from Pydantic validation errors in admin API.
+    if request.url.path.startswith("/v1/admin/"):
+        return JSONResponse({"detail": "VALIDATION_FAILED"}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
 
 @app.exception_handler(GateError)
 async def commercial_gate_exception(request: Request, exc: GateError):
