@@ -1,0 +1,35 @@
+DG-01 | PatroAI R2 — Evidências de testes e proveniência — 2026-11-05
+
+TEST_SOURCE=HISTORICAL_BACKEND_ZIP_PLUS_R2_OVERLAY_PLUS_INCREMENTAL_PATCH
+TEST_SOURCE_IS_GITHUB_HEAD=NO
+TEST_SOURCE_IS_RAILWAY_RUNTIME=NO
+
+Command:
+python -m pytest -q -ra tests/test_single_owner_bootstrap.py test_super_admin_r2.py
+Output: 40 passed, 2 skipped; process exit 0.
+Skipped: two PostgreSQL tests in this environment; NOT a database PASS.
+
+Expanded:
+python -m pytest -q -ra
+Output: 54 passed, 3 failed, 2 skipped; process exit 1.
+First divergence for these 3: absent index.html and baseline_HC11_AUDITADO.html
+in this historical snapshot, not demonstrated as a bootstrap fault.
+
+AO-01 independent isolated ZIP:
+22 pass, 1 fail, 2 skip.
+Failure ModuleNotFoundError: dashboard, because incremental ZIP lacks backend.
+Reconstructed full R2 source eliminates this focused failure.
+
+Operator-presented Railway logical database rehearsal:
+POSTGRES_PERSIST_ROLLBACK_AND_DUPLICATE=PASS
+POSTGRES_CONCURRENT_WRITER_BLOCKED=PASS
+LAB_SYNTHETIC_EXECUTE_END_TO_END_ROLLBACK=PASS
+FINAL_LAB_ACCOUNTS=0
+FINAL_LAB_AUDITS=0
+LAB_PROPOSAL_REHEARSAL=PASS
+These were not rerun during this artifact preparation.
+
+GitHub HEAD SHA=NOT_OBTAINED
+GitHub Actions=NOT_EXECUTED
+PostgreSQL 18 ephemeral job=NOT_EXECUTED
+Commit/push/PR/merge/deploy/DB write=NOT_PERFORMED
