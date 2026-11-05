@@ -18,7 +18,7 @@ class Staff(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    __table_args__ = (CheckConstraint("role IN ('analyst','manager')", name="ck_patroai_staff_role"),)
+    __table_args__ = (CheckConstraint("role IN ('analyst','manager','super_admin')", name="ck_patroai_staff_role"),)
 
 class AuthWindow(Base):
     __tablename__ = "patroai_admin_auth_window"

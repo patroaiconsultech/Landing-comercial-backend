@@ -11,7 +11,7 @@ from typing import Literal
 from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, update, text, func
 from sqlalchemy.orm import Session
 from commercial.models import Handoff
 from commercial.security import Secrets, decrypt
@@ -38,7 +38,10 @@ def error(status:int,code:str):
     raise HTTPException(status_code=status,detail=code)
 
 def ensure_manager(staff:Staff):
-    if staff.role!="manager": error(403,"FORBIDDEN")
+    if staff.role not in ("manager","super_admin"): error(403,"FORBIDDEN")
+
+def ensure_super_admin(staff:Staff):
+    if staff.role!="super_admin": error(403,"FORBIDDEN")
 
 @router.post("/auth/password",status_code=202)
 def login_password(payload:PasswordLogin,request:Request,db:Session=Depends(get_db),cfg:Config=Depends(require_enabled)):
@@ -56,7 +59,7 @@ def login_mfa(payload:MFAChallenge,request:Request,response:Response,
 
 @router.get("/auth/session")
 def current_session(request:Request,staff:Staff=Depends(active_staff),cfg:Config=Depends(require_enabled)):
-    return {"authenticated":True,"role":staff.role,"csrf_token":csrf_token(cfg,request.cookies[COOKIE])}
+    return {"authenticated":True,"role":staff.role,"staff_id":str(staff.id),"csrf_token":csrf_token(cfg,request.cookies[COOKIE])}
 
 @router.post("/auth/logout")
 def logout(request:Request,response:Response,staff:Staff=Depends(active_staff),
@@ -162,3 +165,44 @@ def change_status(handoff_id:UUID,payload:StatusRequest,request:Request,
     db.refresh(h)
     response.headers["ETag"]=f'"v{h.version}"'
     return summary(h)
+
+
+# Role management is server-authoritative. Account creation and recovery are
+# intentionally offline, independently signed operations, NOT browser requests.
+@router.get("/staff")
+def list_staff(request:Request,staff:Staff=Depends(active_staff),
+               db:Session=Depends(get_db),cfg:Config=Depends(require_enabled)):
+    ensure_super_admin(staff)
+    rows=db.scalars(select(Staff).order_by(Staff.email)).all()
+    audit(db,"STAFF_LIST",request,staff.id)
+    db.commit()
+    return {"items":[{"staff_id":str(row.id),"email":row.email,
+                      "role":row.role,"active":row.active} for row in rows]}
+
+@router.post("/staff/{staff_id}/deactivate")
+def deactivate_staff(staff_id:UUID,request:Request,staff:Staff=Depends(active_staff),
+                     db:Session=Depends(get_db),cfg:Config=Depends(require_enabled)):
+    ensure_super_admin(staff)
+    require_csrf(request,cfg)
+    if staff.id==staff_id:
+        error(409,"CANNOT_DISABLE_SELF")
+    # Serialize deactivations: two concurrent requests cannot remove the
+    # last active super_admin in separate replicas.
+    if db.get_bind().dialect.name=="postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(7770002)"))
+    target=db.scalar(select(Staff).where(Staff.id==staff_id).with_for_update())
+    if target is None or not target.active:
+        error(404,"NOT_FOUND")
+    if target.role=="super_admin":
+        count=db.scalar(select(func.count()).select_from(Staff).where(
+            Staff.role=="super_admin",Staff.active.is_(True)))
+        if count<=1:
+            error(409,"LAST_SUPER_ADMIN")
+    target.active=False
+    db.execute(update(StaffSession).where(
+        StaffSession.staff_id==target.id,
+        StaffSession.revoked_at.is_(None)
+    ).values(revoked_at=now()))
+    audit(db,"STAFF_DEACTIVATED",request,staff.id)
+    db.commit()
+    return {"ok":True}

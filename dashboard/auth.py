@@ -157,7 +157,7 @@ def active_staff(request:Request, db:Session=Depends(get_db), cfg:Config=Depends
     if not sess or sess.revoked_at or t>=aware(sess.expires_at) or t-aware(sess.seen_at)>timedelta(minutes=30):
         raise HTTPException(status_code=401,detail="UNAUTHENTICATED")
     staff=db.get(Staff,sess.staff_id)
-    if not staff or not staff.active or staff.role not in ("analyst","manager"):
+    if not staff or not staff.active or staff.role not in ("analyst","manager","super_admin"):
         raise HTTPException(status_code=401,detail="UNAUTHENTICATED")
     sess.seen_at=t
     db.commit()
