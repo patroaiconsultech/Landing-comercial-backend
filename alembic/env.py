@@ -5,6 +5,7 @@ from alembic import context
 from sqlalchemy import create_engine, pool
 from commercial.models import Base
 from dashboard import models  # noqa: F401
+from diagnosis import models as diagnosis_models  # noqa: F401; R3-A proposal metadata
 cfg=context.config
 target_metadata=Base.metadata
 url=os.environ.get("DATABASE_URL","")
