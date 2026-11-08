@@ -1,0 +1,470 @@
+name: PatroAI R3-A — PostgreSQL 18 qualification (synthetic data only)
+
+# Evidence workflow. Runs ONLY on dedicated qualification branches or by manual dispatch.
+# No secrets, no Railway, no real database, no deploy. The lab is a throwaway docker
+# container created and destroyed inside this run.
+on:
+  push:
+    branches:
+      - "qualification/r3a-**"
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Workflow commit SHA this run must be executed on (empty = no check)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r3a-pg18-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LAB_CONTAINER: patroai-r3a-lab
+  LAB_USER: patroai_ci
+  LAB_PASSWORD: patroai_ci_ephemeral_only
+  LAB_DB: patroai_r3a_lab
+  R2_DB: patroai_r2_lab
+  R2I_DB: patroai_r2_integrity
+  RESTORE_DB: patroai_r3a_restore
+  BASELINE_SHA: 05bec0daf2697c37aee6e723d975a93326afae83
+  WORKFLOW_PATH: .github/workflows/r3a-pg18-qualification.yml
+  LAB_URL: postgresql+psycopg://patroai_ci:patroai_ci_ephemeral_only@127.0.0.1:5432/patroai_r3a_lab
+  R2_URL: postgresql+psycopg://patroai_ci:patroai_ci_ephemeral_only@127.0.0.1:5432/patroai_r2_lab
+  R2I_URL: postgresql+psycopg://patroai_ci:patroai_ci_ephemeral_only@127.0.0.1:5432/patroai_r2_integrity
+  PATROAI_ALLOW_MIGRATION_EXECUTION: "true"
+
+jobs:
+  qualify:
+    name: R3-A qualification on ephemeral PostgreSQL 18
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run identification (commit, run id, time)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "QUAL_START_UTC=$(date -u +%FT%TZ)"
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          echo "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT"
+          echo "GITHUB_ACTOR=$GITHUB_ACTOR"
+          echo "RUNNER_OS=$RUNNER_OS RUNNER_IMAGE=${ImageOS:-?}-${ImageVersion:-?}"
+          EXPECTED="${{ github.event.inputs.expected_sha }}"
+          if [ -n "$EXPECTED" ]; then
+            test "$EXPECTED" = "$GITHUB_SHA" && echo "EXPECTED_SHA_MATCH=PASS" || { echo "EXPECTED_SHA_MATCH=FAIL"; exit 1; }
+          else
+            echo "EXPECTED_SHA_MATCH=NOT_REQUESTED"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Git traceability (baseline vs workflow commit)
+        id: trace
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "BASELINE_SHA=$BASELINE_SHA"
+          echo "WORKFLOW_COMMIT_SHA=$(git rev-parse HEAD)"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git cat-file -e "$BASELINE_SHA^{commit}"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
+          echo "COMMITS_AFTER_BASELINE=$(git rev-list --count "$BASELINE_SHA"..HEAD)"
+          git log --format='COMMIT %H %an %aI %s' "$BASELINE_SHA"..HEAD
+          DIFF="$(git diff --name-status --no-renames "$BASELINE_SHA" HEAD)"
+          echo "DIFF_AGAINST_BASELINE:"
+          echo "$DIFF"
+          test "$DIFF" = "$(printf 'A\t%s' "$WORKFLOW_PATH")"
+          echo "DIFF_ONLY_QUALIFICATION_WORKFLOW=PASS"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Hashes of qualified sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD
+          sha256sum alembic/versions/*.py alembic/env.py tests/test_diagnosis*.py \
+            tests/test_single_owner_bootstrap.py test_super_admin_r2.py test_app.py \
+            .github/workflows/*.yml | tee evidence/source-sha256.txt
+          ls index.html baseline_HC11_AUDITADO.html 2>&1 | tee evidence/html-presence.txt || true
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-test.txt pytest
+
+      - name: Start ephemeral PostgreSQL 18 lab
+        id: start_lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name "$LAB_CONTAINER" \
+            -e POSTGRES_USER="$LAB_USER" -e POSTGRES_PASSWORD="$LAB_PASSWORD" -e POSTGRES_DB="$LAB_DB" \
+            -p 127.0.0.1:5432:5432 postgres:18
+          echo "lab_started=true" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 40); do
+            docker exec "$LAB_CONTAINER" pg_isready -U "$LAB_USER" -d "$LAB_DB" && break
+            sleep 2
+          done
+          docker exec "$LAB_CONTAINER" pg_isready -U "$LAB_USER" -d "$LAB_DB"
+          docker inspect -f 'LAB_IMAGE={{.Config.Image}} LAB_IMAGE_ID={{.Image}} LAB_CONTAINER_ID={{.Id}}' "$LAB_CONTAINER" | tee evidence/lab-container.txt
+          docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -At -c "select version()" | tee -a evidence/lab-container.txt
+          docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -At -c "select 'system_identifier='||system_identifier from pg_control_system()" | tee -a evidence/lab-container.txt
+          test "$(docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -At -c 'show server_version_num' | cut -c1-2)" = "18"
+          docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -v ON_ERROR_STOP=1 -c "create database $R2_DB"
+          docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -v ON_ERROR_STOP=1 -c "create database $R2I_DB"
+          cat > "$RUNNER_TEMP/lablib.sh" <<'LIB'
+          P() { local db="$1"; shift; docker exec -i "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$db" -v ON_ERROR_STOP=1 -At "$@"; }
+          # schema fingerprint: columns (name, type, length, nullability, default), constraints
+          # (name, type, validated flag, full definition) and indexes (full definition)
+          schema_fp() {
+            local db="$1" re="$2"
+            echo "## columns"
+            P "$db" -c "select c.table_name||'|'||c.column_name||'|'||c.data_type||'|'||coalesce(c.character_maximum_length::text,'')||'|'||c.is_nullable||'|'||coalesce(c.column_default,'') from information_schema.columns c where c.table_schema='public' and c.table_name ~ '$re' order by 1"
+            echo "## constraints"
+            P "$db" -c "select conrelid::regclass||'|'||conname||'|'||contype||'|validated='||convalidated||'|'||pg_get_constraintdef(oid) from pg_constraint where conrelid::regclass::text ~ '$re' order by 1"
+            echo "## indexes"
+            P "$db" -c "select tablename||'|'||indexname||'|'||indexdef from pg_indexes where schemaname='public' and tablename ~ '$re' order by 1"
+          }
+          # data fingerprint: row count and md5 of all rows per table
+          data_fp() {
+            local db="$1"; shift
+            local t
+            for t in "$@"; do
+              echo "$t|rows=$(P "$db" -c "select count(*) from $t")|md5=$(P "$db" -c "select coalesce(md5(string_agg(x::text,'|' order by x::text)),'empty') from $t x")"
+            done
+          }
+          LIB
+
+      - name: Alembic 0001 -> 0002 -> 0003 on R3-A lab
+        id: alembic
+        shell: bash
+        env:
+          DATABASE_URL: ${{ env.LAB_URL }}
+        run: |
+          set -euo pipefail
+          for rev in 0001_patroai 0002_patroai_super_admin_r2 0003_patroai_diagnosis_r3a; do
+            echo "ALEMBIC_UPGRADE_START $rev $(date -u +%FT%TZ)"
+            python -m alembic upgrade "$rev"
+            echo "ALEMBIC_UPGRADE_EXIT=0 $rev"
+            python -m alembic current
+            docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -At -c "select 'alembic_version='||version_num from public.alembic_version"
+          done 2>&1 | tee evidence/alembic-r3a-lab.log
+          test "$(docker exec "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -At -c 'select version_num from public.alembic_version')" = "0003_patroai_diagnosis_r3a"
+
+      - name: Verify R3-A schema, constraints and indexes
+        id: schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          P() { docker exec -i "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -v ON_ERROR_STOP=1 -At "$@"; }
+          {
+          echo "-- tables"; P -c "select table_name from information_schema.tables where table_schema='public' and table_name like 'patroai_diagnosis%' order by 1"
+          echo "-- constraints"; P -c "select conrelid::regclass||'|'||conname||'|'||contype from pg_constraint where conrelid::regclass::text like 'patroai_diagnosis%' order by 1"
+          echo "-- indexes"; P -c "select indexname from pg_indexes where schemaname='public' and tablename like 'patroai_diagnosis%' order by 1"
+          } | tee evidence/r3a-schema.txt
+          n=$(P -c "select count(*) from information_schema.tables where table_schema='public' and table_name in ('patroai_diagnosis','patroai_diagnosis_turn','patroai_diagnosis_event','patroai_diagnosis_audit','patroai_diagnosis_rate')")
+          test "$n" = "5" && echo "R3A_TABLES=5_PASS"
+          n=$(P -c "select count(*) from pg_constraint where conname in ('ck_patroai_diagnosis_status','ck_patroai_diagnosis_counts','ck_patroai_diagnosis_turn_status','uq_patroai_diag_event_once')")
+          test "$n" = "4" && echo "R3A_NAMED_CONSTRAINTS=4_PASS"
+          n=$(P -c "select count(*) from pg_indexes where schemaname='public' and indexname in ('ix_patroai_diagnosis_status_created','ix_patroai_diagnosis_retention','ix_patroai_diag_turn_history')")
+          test "$n" = "3" && echo "R3A_NAMED_INDEXES=3_PASS"
+          n=$(P -c "select count(*) from pg_constraint where contype='f' and conrelid::regclass::text like 'patroai_diagnosis%'")
+          test "$n" = "3" && echo "R3A_FOREIGN_KEYS=3_PASS"
+          n=$(P -c "select count(*) from pg_constraint where contype='p' and conrelid::regclass::text like 'patroai_diagnosis%'")
+          test "$n" = "5" && echo "R3A_PRIMARY_KEYS=5_PASS"
+          # R1/R2 tables untouched and empty
+          test "$(P -c 'select count(*) from patroai_admin_staff')" = "0" && echo "R2_STAFF_EMPTY=PASS"
+
+      - name: R3-A PostgreSQL integration tests (no skip accepted)
+        id: r3a_pg
+        shell: bash
+        env:
+          PATROAI_R3A_LAB_DATABASE_URL: ${{ env.LAB_URL }}
+          PATROAI_R3A_LAB_ACK: EPHEMERAL_PG18_ONLY
+        run: |
+          set -uo pipefail
+          date -u +"R3A_PG_START=%FT%TZ"
+          python -m pytest -v -ra -m integration_postgres tests/test_diagnosis_postgres_r3a.py \
+            --junitxml=evidence/r3a-pg-integration.xml 2>&1 | tee evidence/r3a-pg-integration.log
+          rc=${PIPESTATUS[0]}
+          echo "R3A_PG_PYTEST_EXIT=$rc"
+          date -u +"R3A_PG_END=%FT%TZ"
+          python - <<'PY'
+          from xml.etree import ElementTree as ET
+          cases = list(ET.parse("evidence/r3a-pg-integration.xml").getroot().iter("testcase"))
+          res = {"pass": 0, "fail": 0, "skip": 0}
+          for c in cases:
+              if c.find("skipped") is not None: res["skip"] += 1
+              elif c.find("failure") is not None or c.find("error") is not None: res["fail"] += 1
+              else: res["pass"] += 1
+          print("R3A_PG_RESULT", res, "cases", len(cases))
+          assert len(cases) == 2 and res == {"pass": 2, "fail": 0, "skip": 0}, res
+          print("R3A_PG_TWO_TESTS=PASS_NO_SKIPS")
+          PY
+          exit "$rc"
+
+      - name: R3-A unit tests (no database)
+        id: r3a_unit
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          python -m pytest -v -ra -m "not integration_postgres" tests/test_diagnosis_r3a.py tests/test_diagnosis_budget_r3a.py \
+            --junitxml=evidence/r3a-unit.xml 2>&1 | tee evidence/r3a-unit.log
+          rc=${PIPESTATUS[0]}
+          echo "R3A_UNIT_PYTEST_EXIT=$rc"
+          exit "$rc"
+
+      - name: R2 regression, focused tests
+        id: r2_focused
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          python -m pytest -v -ra -m "not integration_postgres" tests/test_single_owner_bootstrap.py test_super_admin_r2.py \
+            --junitxml=evidence/r2-focused.xml 2>&1 | tee evidence/r2-focused.log
+          rc=${PIPESTATUS[0]}
+          echo "R2_FOCUSED_PYTEST_EXIT=$rc"
+          exit "$rc"
+
+      - name: R2 PostgreSQL integration (separate lab database at 0002)
+        id: r2_pg
+        if: always()
+        shell: bash
+        env:
+          DATABASE_URL: ${{ env.R2_URL }}
+          PATROAI_BOOTSTRAP_TEST_DATABASE_URL: ${{ env.R2_URL }}
+        run: |
+          set -uo pipefail
+          python -m alembic upgrade 0001_patroai && python -m alembic upgrade 0002_patroai_super_admin_r2 || { echo "R2_PG_ALEMBIC_EXIT=1"; exit 1; }
+          python -m pytest -v -ra -m integration_postgres tests/test_single_owner_bootstrap.py \
+            --junitxml=evidence/r2-pg.xml 2>&1 | tee evidence/r2-pg.log
+          rc=${PIPESTATUS[0]}
+          echo "R2_PG_PYTEST_EXIT=$rc"
+          exit "$rc"
+
+      - name: R2 functional regression (whole suite except the legacy landing smoke file)
+        id: r2_functional
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          python -m pytest -v -ra -m "not integration_postgres" --ignore=test_app.py \
+            --junitxml=evidence/r2-functional.xml 2>&1 | tee evidence/r2-functional.log
+          rc=${PIPESTATUS[0]}
+          echo "R2_FUNCTIONAL_PYTEST_EXIT=$rc"
+          exit "$rc"
+
+      - name: R2 legacy landing smoke (test_app.py; needs index.html and baseline_HC11_AUDITADO.html)
+        id: r2_legacy
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Real results are preserved. Missing HTML files are NOT created or faked here.
+          python -m pytest -v -ra test_app.py --junitxml=evidence/r2-legacy-smoke.xml 2>&1 | tee evidence/r2-legacy-smoke.log
+          rc=${PIPESTATUS[0]}
+          echo "R2_LEGACY_SMOKE_PYTEST_EXIT=$rc"
+          python - <<'PY' | tee evidence/r2-legacy-smoke-failures.txt
+          from xml.etree import ElementTree as ET
+          root = ET.parse("evidence/r2-legacy-smoke.xml").getroot()
+          tot = {"pass": 0, "fail": 0, "skip": 0}
+          for c in root.iter("testcase"):
+              f = c.find("failure") if c.find("failure") is not None else c.find("error")
+              if c.find("skipped") is not None: tot["skip"] += 1
+              elif f is not None:
+                  tot["fail"] += 1
+                  msg = (f.attrib.get("message") or "")[:200].replace("\n", " ")
+                  print("R2_LEGACY_FAILED", c.attrib.get("classname"), c.attrib.get("name"), "|", msg)
+              else: tot["pass"] += 1
+          print("R2_LEGACY_RESULT", tot)
+          PY
+          exit "$rc"
+
+      - name: R2 schema and synthetic records preserved across 0003 (separate database)
+        id: r2_integrity
+        if: always()
+        shell: bash
+        env:
+          DATABASE_URL: ${{ env.R2I_URL }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/lablib.sh"
+          RE='^(patroai_handoff|patroai_handoff_key|patroai_handoff_audit|patroai_admin_staff|patroai_admin_auth_window|patroai_admin_login_challenge|patroai_admin_session|patroai_admin_audit)$'
+          TABLES="patroai_handoff patroai_handoff_key patroai_handoff_audit patroai_admin_staff patroai_admin_auth_window patroai_admin_login_challenge patroai_admin_session patroai_admin_audit"
+          python -m alembic upgrade 0001_patroai
+          python -m alembic upgrade 0002_patroai_super_admin_r2
+          test "$(P "$R2I_DB" -c 'select version_num from public.alembic_version')" = "0002_patroai_super_admin_r2"
+          # Synthetic R2 records (generated; this database is separate from the R3-A lab, whose staff table stays empty)
+          P "$R2I_DB" <<'SQL'
+          insert into patroai_admin_staff (id,email,password_salt,password_digest,totp_ciphertext,role,created_at)
+          select md5('s'||i)::uuid, 'synthetic-'||i||'@example.invalid', decode(md5('salt'||i),'hex'),
+                 decode(md5('d'||i)||md5('D'||i),'hex'), 'synthetic'::bytea,
+                 (array['analyst','manager','super_admin'])[i], now()
+          from generate_series(1,3) i;
+          insert into patroai_handoff (id,conversation_id,transcript_ciphertext,contact_preference,consent_version,transcript_provenance,status,version,received_at,retention_due_at)
+          select md5('h'||i)::uuid, md5('c'||i)::uuid, 'synthetic'::bytea, 'none', 'synthetic-v1', 'user_submitted', 'new', 1, now(), now()+interval '30 days'
+          from generate_series(1,2) i;
+          insert into patroai_handoff_key (key_hmac,request_hmac,handoff_id,created_at,replay_until,tombstone_until)
+          select decode(md5('k'||i)||md5('K'||i),'hex'), decode(md5('r'||i)||md5('R'||i),'hex'), md5('h'||i)::uuid, now(), now(), now()
+          from generate_series(1,2) i;
+          insert into patroai_handoff_audit (id,handoff_id,event,happened_at)
+          select md5('a'||i)::uuid, md5('h'||i)::uuid, 'synthetic', now() from generate_series(1,2) i;
+          insert into patroai_admin_auth_window (key_digest,window_started_at,failures)
+          select decode(md5('w'||i)||md5('W'||i),'hex'), now(), i from generate_series(1,2) i;
+          insert into patroai_admin_login_challenge (token_digest,staff_id,created_at,expires_at,failures)
+          values (decode(md5('t1')||md5('T1'),'hex'), md5('s1')::uuid, now(), now()+interval '5 minutes', 0);
+          insert into patroai_admin_session (token_digest,staff_id,created_at,seen_at,expires_at)
+          values (decode(md5('t2')||md5('T2'),'hex'), md5('s1')::uuid, now(), now(), now()+interval '1 hour');
+          insert into patroai_admin_audit (id,event,request_id,occurred_at)
+          select md5('au'||i)::uuid, 'synthetic', 'req-'||i, now() from generate_series(1,3) i;
+          SQL
+          { schema_fp "$R2I_DB" "$RE"; echo "## data"; data_fp "$R2I_DB" $TABLES; } > evidence/r2-integrity-before-0003.txt
+          python -m alembic upgrade 0003_patroai_diagnosis_r3a
+          test "$(P "$R2I_DB" -c 'select version_num from public.alembic_version')" = "0003_patroai_diagnosis_r3a"
+          { schema_fp "$R2I_DB" "$RE"; echo "## data"; data_fp "$R2I_DB" $TABLES; } > evidence/r2-integrity-after-0003.txt
+          cat evidence/r2-integrity-before-0003.txt
+          grep -c . evidence/r2-integrity-before-0003.txt
+          diff -u evidence/r2-integrity-before-0003.txt evidence/r2-integrity-after-0003.txt
+          echo "R2_SCHEMA_AND_RECORDS_PRESERVED_ACROSS_0003=PASS"
+
+      - name: Seed synthetic data, pg_dump and pg_restore into disposable database
+        id: dump_restore
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/lablib.sh"
+          date -u +"DUMP_RESTORE_START=%FT%TZ"
+          # Synthetic rows only (generated, no real data, no PII)
+          P "$LAB_DB" <<'SQL'
+          insert into patroai_diagnosis
+            (id, init_key_digest, init_payload_digest, session_digest, session_expires_at, consent_ai, consent_contact,
+             consent_notice_version, consent_accepted_at, status, version, turn_count, created_at, last_activity_at, retention_due_at)
+          select gen_random_uuid(),
+                 decode(md5('k'||i)||md5('K'||i),'hex'), decode(md5('p'||i)||md5('P'||i),'hex'), decode(md5('s'||i)||md5('S'||i),'hex'),
+                 now()+interval '1 day', true, true, 'synthetic-v1', now(), 'registered', 1, 0, now(), now(), now()+interval '30 days'
+          from generate_series(1,50) i;
+          insert into patroai_diagnosis_turn
+            (id, diagnosis_id, request_digest, user_ciphertext, language, status, expected_version, created_at, lease_until)
+          select gen_random_uuid(), d.id, decode(md5(d.id::text)||md5(d.id::text),'hex'), 'synthetic'::bytea, 'pt', 'complete', 1, now(), now()
+          from patroai_diagnosis d;
+          insert into patroai_diagnosis_event (id, diagnosis_id, kind, created_at)
+          select gen_random_uuid(), id, 'synthetic', now() from patroai_diagnosis;
+          insert into patroai_diagnosis_audit (id, diagnosis_id, event, happened_at)
+          select gen_random_uuid(), id, 'synthetic', now() from patroai_diagnosis;
+          insert into patroai_diagnosis_rate (key_digest, window_started_at, count)
+          select decode(md5('r'||i)||md5('R'||i),'hex'), now(), i from generate_series(1,10) i;
+          SQL
+          fingerprint() {
+            local db="$1"
+            echo "## data"
+            data_fp "$db" patroai_diagnosis patroai_diagnosis_turn patroai_diagnosis_event patroai_diagnosis_audit patroai_diagnosis_rate patroai_admin_staff patroai_handoff
+            echo "alembic=$(P "$db" -c 'select version_num from public.alembic_version')"
+            schema_fp "$db" '^patroai_'
+          }
+          fingerprint "$LAB_DB" | tee evidence/fingerprint-source.txt
+          docker exec "$LAB_CONTAINER" pg_dump --version | tee evidence/dump-restore.log
+          docker exec "$LAB_CONTAINER" pg_dump -U "$LAB_USER" -d "$LAB_DB" -Fc -f /tmp/r3a.dump
+          echo "PG_DUMP_EXIT=0 (set -e would have stopped on failure)" | tee -a evidence/dump-restore.log
+          docker exec "$LAB_CONTAINER" sha256sum /tmp/r3a.dump | tee -a evidence/dump-restore.log
+          docker exec "$LAB_CONTAINER" ls -l /tmp/r3a.dump | tee -a evidence/dump-restore.log
+          P postgres -c "create database $RESTORE_DB"
+          docker exec "$LAB_CONTAINER" pg_restore -U "$LAB_USER" -d "$RESTORE_DB" --exit-on-error --no-owner /tmp/r3a.dump
+          echo "PG_RESTORE_EXIT=0 (set -e would have stopped on failure)" | tee -a evidence/dump-restore.log
+          fingerprint "$RESTORE_DB" | tee evidence/fingerprint-restored.txt
+          grep -c . evidence/fingerprint-source.txt
+          diff -u evidence/fingerprint-source.txt evidence/fingerprint-restored.txt
+          echo "RESTORE_INTEGRITY_DATA_NAMES_TYPES_CONSTRAINTS_VALIDATED_INDEXES=PASS" | tee -a evidence/dump-restore.log
+          date -u +"DUMP_RESTORE_END=%FT%TZ"
+
+      - name: Destroy the lab (always) and prove it
+        id: destroy
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          date -u +"LAB_DESTROY_START=%FT%TZ"
+          echo "LAB_STARTED_OUTPUT=${{ steps.start_lab.outputs.lab_started }}"
+          ID_BEFORE="$(docker ps -a -q --no-trunc -f "name=^/${LAB_CONTAINER}$" || true)"
+          if [ -z "$ID_BEFORE" ]; then
+            echo "LAB_DESTROYED=NOT_APPLICABLE_LAB_NEVER_EXISTED"
+            exit 1
+          fi
+          echo "LAB_CONTAINER_ID=$ID_BEFORE"
+          docker rm -f -v "$LAB_CONTAINER"
+          rm_rc=$?
+          echo "LAB_RM_EXIT=$rm_rc"
+          if [ "$rm_rc" != "0" ]; then echo "LAB_DESTROYED=FAIL_RM_EXIT_$rm_rc"; exit 1; fi
+          if [ -n "$(docker ps -a -q --no-trunc -f "name=^/${LAB_CONTAINER}$" || true)" ]; then
+            echo "LAB_DESTROYED=FAIL_NAME_STILL_PRESENT"; exit 1
+          fi
+          if docker inspect "$ID_BEFORE" >/dev/null 2>&1; then
+            echo "LAB_DESTROYED=FAIL_ID_STILL_INSPECTABLE"; exit 1
+          fi
+          if (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+            echo "LAB_PORT_5432_CLOSED=FAIL"; exit 1
+          fi
+          echo "LAB_PORT_5432_CLOSED=PASS"
+          echo "LAB_DESTROYED=PASS container_id=$ID_BEFORE"
+          date -u +"LAB_DESTROY_END=%FT%TZ"
+
+      - name: Verdict (real outcomes, no masking)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "## PatroAI R3-A qualification"
+            echo "- baseline: \`$BASELINE_SHA\`"
+            echo "- workflow commit: \`$GITHUB_SHA\`  run: \`$GITHUB_RUN_ID\` attempt \`$GITHUB_RUN_ATTEMPT\`  finished: $(date -u +%FT%TZ)"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "|---|---|"
+            echo "| Git traceability (diff only the workflow) | ${{ steps.trace.outcome }} |"
+            echo "| Lab started | ${{ steps.start_lab.outcome }} |"
+            echo "| Alembic 0001 to 0003 | ${{ steps.alembic.outcome }} |"
+            echo "| R3-A schema, constraints, indexes | ${{ steps.schema.outcome }} |"
+            echo "| R3-A PostgreSQL integration (2 tests) | ${{ steps.r3a_pg.outcome }} |"
+            echo "| R3-A unit tests | ${{ steps.r3a_unit.outcome }} |"
+            echo "| R2 focused tests | ${{ steps.r2_focused.outcome }} |"
+            echo "| R2 PostgreSQL integration | ${{ steps.r2_pg.outcome }} |"
+            echo "| R2 functional regression | ${{ steps.r2_functional.outcome }} |"
+            echo "| R2 schema and records preserved across 0003 | ${{ steps.r2_integrity.outcome }} |"
+            echo "| pg_dump / pg_restore integrity | ${{ steps.dump_restore.outcome }} |"
+            echo "| Lab destroyed | ${{ steps.destroy.outcome }} |"
+            echo "| R2 legacy landing smoke (test_app.py, separate caveat) | ${{ steps.r2_legacy.outcome }} |"
+          } | tee evidence/verdict.md >> "$GITHUB_STEP_SUMMARY"
+          core=0
+          for o in "${{ steps.trace.outcome }}" "${{ steps.start_lab.outcome }}" "${{ steps.alembic.outcome }}" "${{ steps.schema.outcome }}" \
+                   "${{ steps.r3a_pg.outcome }}" "${{ steps.r3a_unit.outcome }}" "${{ steps.r2_focused.outcome }}" "${{ steps.r2_pg.outcome }}" \
+                   "${{ steps.r2_functional.outcome }}" "${{ steps.r2_integrity.outcome }}" "${{ steps.dump_restore.outcome }}" "${{ steps.destroy.outcome }}"; do
+            [ "$o" = "success" ] || core=1
+          done
+          legacy=0
+          [ "${{ steps.r2_legacy.outcome }}" = "success" ] || legacy=1
+          [ "$core" = "0" ] && echo "QUALIFICATION_CORE=PASS" || echo "QUALIFICATION_CORE=FAIL"
+          [ "$legacy" = "0" ] && echo "R2_LEGACY_SMOKE=PASS" || echo "R2_LEGACY_SMOKE=FAIL (see evidence/r2-legacy-smoke-failures.txt; acceptance is an AO-01 decision)"
+          (cd evidence && sha256sum * > SHA256SUMS.txt; cat SHA256SUMS.txt)
+          # Not masked: the run is red if the core or the legacy smoke failed.
+          [ "$core" = "0" ] && [ "$legacy" = "0" ]
+
+      - name: Upload sanitized logs (optional download; logs are also in the run page)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r3a-pg18-evidence-${{ github.run_id }}
+          path: evidence/
+          retention-days: 30
