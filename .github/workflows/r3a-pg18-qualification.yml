@@ -133,7 +133,7 @@ jobs:
             echo "## columns"
             P "$db" -c "select c.table_name||'|'||c.column_name||'|'||c.data_type||'|'||coalesce(c.character_maximum_length::text,'')||'|'||c.is_nullable||'|'||coalesce(c.column_default,'') from information_schema.columns c where c.table_schema='public' and c.table_name ~ '$re' order by 1"
             echo "## constraints"
-            P "$db" -c "select conrelid::regclass||'|'||conname||'|'||contype||'|validated='||convalidated||'|'||pg_get_constraintdef(oid) from pg_constraint where conrelid::regclass::text ~ '$re' order by 1"
+            P "$db" -c "select conrelid::regclass||'|'||conname||'|'||contype::text||'|validated='||convalidated||'|'||pg_get_constraintdef(oid) from pg_constraint where conrelid::regclass::text ~ '$re' order by 1"
             echo "## indexes"
             P "$db" -c "select tablename||'|'||indexname||'|'||indexdef from pg_indexes where schemaname='public' and tablename ~ '$re' order by 1"
           }
@@ -171,7 +171,7 @@ jobs:
           P() { docker exec -i "$LAB_CONTAINER" psql -U "$LAB_USER" -d "$LAB_DB" -v ON_ERROR_STOP=1 -At "$@"; }
           {
           echo "-- tables"; P -c "select table_name from information_schema.tables where table_schema='public' and table_name like 'patroai_diagnosis%' order by 1"
-          echo "-- constraints"; P -c "select conrelid::regclass||'|'||conname||'|'||contype from pg_constraint where conrelid::regclass::text like 'patroai_diagnosis%' order by 1"
+          echo "-- constraints"; P -c "select conrelid::regclass||'|'||conname||'|'||contype::text from pg_constraint where conrelid::regclass::text like 'patroai_diagnosis%' order by 1"
           echo "-- indexes"; P -c "select indexname from pg_indexes where schemaname='public' and tablename like 'patroai_diagnosis%' order by 1"
           } | tee evidence/r3a-schema.txt
           n=$(P -c "select count(*) from information_schema.tables where table_schema='public' and table_name in ('patroai_diagnosis','patroai_diagnosis_turn','patroai_diagnosis_event','patroai_diagnosis_audit','patroai_diagnosis_rate')")
