@@ -1,9 +1,7 @@
-import hashlib
-import json
 import os
 from pathlib import Path
-import re
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,31 +9,9 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import app as application
 
-ROOT = Path(__file__).resolve().parent
-BASELINE_SHA = "558e58ff16a5a1f626dd682b7a73a9b98f035a8ff067d64a3bfcedf7bf121d71"
-SOURCE = ROOT / "baseline_HC11_AUDITADO.html"
-
-class TestLanding(unittest.TestCase):
-    def test_baseline_preserved_exactly(self):
-        self.assertEqual(hashlib.sha256(SOURCE.read_bytes()).hexdigest(), BASELINE_SHA)
-        current=(ROOT/"index.html").read_bytes()
-        baseline=SOURCE.read_bytes()
-        self.assertEqual(current.count(b'<script id="patroai-public-agent-js">'), 1)
-        self.assertEqual(current.count(b'<style id="patroai-public-agent-css">'), 1)
-        start=current.index(b'<style id="patroai-public-agent-css">')
-        end=current.index(b'</body>',start)
-        self.assertEqual(current[:start]+current[end:],baseline)
-
-    def test_no_f01_to_f04_or_secret(self):
-        html=(ROOT/"index.html").read_text("utf-8")
-        self.assertEqual(len(re.findall(r"<form\b", html, re.I)), 0)
-        self.assertGreaterEqual(html.count("https://wa.me/5551989697605"),4)
-        self.assertNotIn("OPENAI_API_KEY",html)
-        self.assertIn('content="noindex, nofollow"',html)
-        self.assertIn("pa-consent",html)
-        self.assertIn("textContent=text",html)
 
 class TestApi(unittest.TestCase):
+
     def setUp(self):
         application._by_client.clear()
         application._global_used=0
@@ -46,12 +22,52 @@ class TestApi(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
 
-    def test_home_and_status(self):
-        r=self.client.get("/")
-        self.assertEqual(r.status_code,200)
-        self.assertIn("Pergunte à IA",r.text)
-        self.assertEqual(self.client.get("/v1/public/chat/status").json()["available"],True)
-        self.assertIn("nosniff",r.headers["x-content-type-options"])
+    def test_api_root_without_distributed_html_is_explicit_404(self):
+        # A landing publica-se no frontend; a API pode ser implantada sem HTML.
+        with tempfile.TemporaryDirectory() as folder:
+            missing = Path(folder) / "not-distributed.html"
+            with patch.object(application, "HTML_FILE", missing):
+                for route in ("/", "/index.html"):
+                    with self.subTest(route=route):
+                        response = self.client.get(route)
+                        self.assertEqual(response.status_code, 404)
+                        self.assertEqual(
+                            response.json()["detail"], "LANDING_NOT_AVAILABLE_ON_API"
+                        )
+                        self.assertIn("nosniff", response.headers["x-content-type-options"])
+
+    def test_api_root_with_legacy_html_preserves_200_compatibility(self):
+        # Fixture temporária, sem exigir HTML de frontend no pacote da API.
+        html = "<!doctype html><html lang='pt-BR'><body>Legacy fixture</body></html>"
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = Path(folder) / "legacy-index.html"
+            fixture.write_text(html, encoding="utf-8")
+            with patch.object(application, "HTML_FILE", fixture):
+                for route in ("/", "/index.html"):
+                    with self.subTest(route=route):
+                        response = self.client.get(route)
+                        self.assertEqual(response.status_code, 200)
+                        self.assertIn("text/html", response.headers["content-type"])
+                        self.assertEqual(response.text, html)
+                        self.assertIn("nosniff", response.headers["x-content-type-options"])
+
+    def test_health_and_public_chat_status_do_not_require_html(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(application, "HTML_FILE", Path(folder) / "missing.html"):
+                response = self.client.get("/healthz")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["ok"], True)
+                self.assertEqual(response.json()["agent_available"], True)
+
+                status = self.client.get("/v1/public/chat/status")
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["available"], True)
+
+                with patch.dict(os.environ, {"CHAT_ENABLED": "false"}):
+                    self.assertEqual(self.client.get("/healthz").json()["ok"], True)
+                    self.assertEqual(
+                        self.client.get("/v1/public/chat/status").json()["available"], False
+                    )
 
     def test_disabled_explicit(self):
         with patch.dict(os.environ,{"CHAT_ENABLED":"false"}):
